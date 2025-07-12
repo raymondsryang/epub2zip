@@ -3,13 +3,20 @@ package main
 import (
 	"archive/zip"
 	"encoding/xml"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/widget"
 )
 
 type ManifestItem struct {
@@ -17,14 +24,17 @@ type ManifestItem struct {
 	Href      string `xml:"href,attr"`
 	MediaType string `xml:"media-type,attr"`
 }
+
 type Manifest struct {
 	Items []ManifestItem `xml:"item"`
 }
+
 type Spine struct {
 	Itemrefs []struct {
 		IDRef string `xml:"idref,attr"`
 	} `xml:"itemref"`
 }
+
 type Package struct {
 	Manifest Manifest `xml:"manifest"`
 	Spine    Spine    `xml:"spine"`
@@ -56,43 +66,29 @@ func findOpfFile(r *zip.ReadCloser) (string, error) {
 	return "", fmt.Errorf("container.xml not found")
 }
 
-func getImagesByManifestOrder(opfData []byte) ([]string, error) {
-	// 按 manifest 顺序解析所有图片
+func getImagesByManifestOrder(opfData []byte, opfDir string) ([]string, error) {
 	var pkg Package
 	if err := xml.Unmarshal(opfData, &pkg); err != nil {
 		return nil, err
 	}
-	imgs := make(map[string]string)
-	var imgIDs []string
+	var imgHrefs []string
 	for _, item := range pkg.Manifest.Items {
 		if strings.HasPrefix(item.MediaType, "image/") {
-			imgs[item.ID] = item.Href
+			imgHrefs = append(imgHrefs, filepath.Clean(filepath.Join(opfDir, item.Href)))
 		}
 	}
-	for _, item := range pkg.Manifest.Items {
-		if _, ok := imgs[item.ID]; ok {
-			imgIDs = append(imgIDs, item.ID)
-		}
-	}
-	ordered := []string{}
-	for _, id := range imgIDs {
-		ordered = append(ordered, imgs[id])
-	}
-	return ordered, nil
+	return imgHrefs, nil
 }
 
 func getImagesByPageHtml(opfData []byte, r *zip.ReadCloser, opfDir string) ([]string, error) {
-	// 解析spine，按页面顺序依次取html，再从html内取img src
 	var pkg Package
 	if err := xml.Unmarshal(opfData, &pkg); err != nil {
 		return nil, err
 	}
-	// id => ManifestItem
 	manifestMap := make(map[string]ManifestItem)
 	for _, item := range pkg.Manifest.Items {
 		manifestMap[item.ID] = item
 	}
-	// spine顺序中的页面
 	var pageHtmlItems []ManifestItem
 	for _, ref := range pkg.Spine.Itemrefs {
 		item, ok := manifestMap[ref.IDRef]
@@ -100,43 +96,33 @@ func getImagesByPageHtml(opfData []byte, r *zip.ReadCloser, opfDir string) ([]st
 			pageHtmlItems = append(pageHtmlItems, item)
 		}
 	}
-
-	// EPub文件索引
 	fileMap := make(map[string]*zip.File)
 	for _, f := range r.File {
 		fileMap[f.Name] = f
 	}
-
-	// 用正则找img标签和src，兼容自闭合与正常标签
 	imgSrcPattern := regexp.MustCompile(`<img\s+[^>]*src\s*=\s*['"]([^'"]+)['"][^>]*\/?>`)
 	var imgHrefs []string
-	seen := make(map[string]struct{}) // 去重（常见于某些epub同文件多次引用）
-
+	seen := make(map[string]struct{})
 	for _, page := range pageHtmlItems {
 		pagePath := filepath.Clean(filepath.Join(opfDir, page.Href))
 		pageFile, ok := fileMap[pagePath]
 		if !ok {
-			fmt.Fprintf(os.Stderr, "[Warn] page file not found: %s\n", pagePath)
 			continue
 		}
 		rc, err := pageFile.Open()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Warn] cannot open page file: %s\n", pageFile.Name)
 			continue
 		}
 		htmlData, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Warn] cannot read page file: %s\n", pageFile.Name)
 			continue
 		}
 		matches := imgSrcPattern.FindAllSubmatch(htmlData, -1)
 		for _, m := range matches {
 			src := string(m[1])
-			// 构造图片真实路径（相对于页面文件）
 			imgPath := filepath.Clean(filepath.Join(filepath.Dir(pagePath), src))
 			if _, ok := fileMap[imgPath]; !ok {
-				fmt.Fprintf(os.Stderr, "[Warn] img %s not found in archive\n", imgPath)
 				continue
 			}
 			if _, ok := seen[imgPath]; !ok {
@@ -148,31 +134,16 @@ func getImagesByPageHtml(opfData []byte, r *zip.ReadCloser, opfDir string) ([]st
 	return imgHrefs, nil
 }
 
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(),
-			"用法: %s [-mode mode] input.epub output.zip\n", os.Args[0])
-		fmt.Fprintf(flag.CommandLine.Output(),
-			"    -mode 可选值: manifest/page   (默认: page)\n")
-	}
-	mode := flag.String("mode", "page", "顺序模式: manifest 或 page")
-	flag.Parse()
-	if flag.NArg() < 2 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	epubPath := flag.Arg(0)
-	zipPath := flag.Arg(1)
-
-	r, err := zip.OpenReader(epubPath)
+func convertEpub(epubFile string, mode string, progress func(p float64, text string)) error {
+	r, err := zip.OpenReader(epubFile)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("open epub: %w", err)
 	}
 	defer r.Close()
 
 	opfPath, err := findOpfFile(r)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("find opf: %w", err)
 	}
 
 	var opfData []byte
@@ -180,84 +151,209 @@ func main() {
 		if f.Name == opfPath {
 			rc, err := f.Open()
 			if err != nil {
-				panic(err)
+				return err
 			}
 			opfData, err = io.ReadAll(rc)
 			rc.Close()
 			if err != nil {
-				panic(err)
+				return err
 			}
 			break
 		}
 	}
 	if opfData == nil {
-		panic("opf file not found")
+		return fmt.Errorf("opf file not found")
 	}
-
 	opfDir := filepath.Dir(opfPath)
-	var imageOrder []string
-
-	switch *mode {
+	var imgOrder []string
+	switch mode {
 	case "manifest":
-		imageOrder, err = getImagesByManifestOrder(opfData)
-		if err != nil {
-			panic(err)
-		}
-		// 路径转为相对opf的真实路径
-		for i := range imageOrder {
-			imageOrder[i] = filepath.Clean(filepath.Join(opfDir, imageOrder[i]))
-		}
+		imgOrder, err = getImagesByManifestOrder(opfData, opfDir)
 	case "page":
-		imageOrder, err = getImagesByPageHtml(opfData, r, opfDir)
-		if err != nil {
-			panic(err)
-		}
+		imgOrder, err = getImagesByPageHtml(opfData, r, opfDir)
 	default:
-		fmt.Fprintf(os.Stderr, "未知mode: %s，仅可用 page 或 manifest\n", *mode)
-		os.Exit(1)
+		return fmt.Errorf("unknown mode")
+	}
+	if err != nil {
+		return fmt.Errorf("parse images: %w", err)
 	}
 
-	// 构建epub内容map
 	imgMap := make(map[string]*zip.File)
 	for _, f := range r.File {
 		imgMap[f.Name] = f
 	}
-
-	// 写到zip
-	outZip, err := os.Create(zipPath)
+	outZip := epubFile[:len(epubFile)-len(filepath.Ext(epubFile))] + ".zip"
+	zf, err := os.Create(outZip)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	defer outZip.Close()
-	zw := zip.NewWriter(outZip)
+	defer zf.Close()
+	zw := zip.NewWriter(zf)
 	defer zw.Close()
 
-	for i, imgPath := range imageOrder {
+	total := float64(len(imgOrder))
+	for i, imgPath := range imgOrder {
 		imgFile, ok := imgMap[imgPath]
 		if !ok {
-			fmt.Fprintf(os.Stderr, "[Warn] image not found: %s, skip\n", imgPath)
+			progress(float64(i)/total, fmt.Sprintf("图片缺失: %s", imgPath))
 			continue
 		}
 		rc, err := imgFile.Open()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Warn] cannot open image %s: %v, skip.\n", imgFile.Name, err)
+			progress(float64(i)/total, fmt.Sprintf("打开失败: %s", imgPath))
 			continue
 		}
-		// 提取扩展名，防止多 . 或大小写问题
 		ext := strings.ToLower(filepath.Ext(imgFile.Name))
 		imgName := fmt.Sprintf("%d%s", i, ext)
 		w, err := zw.Create(imgName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[Warn] cannot create %s in zip: %v, skip.\n", imgName, err)
 			rc.Close()
+			progress(float64(i)/total, fmt.Sprintf("压缩失败: %s", imgName))
 			continue
 		}
 		_, copyErr := io.Copy(w, rc)
 		rc.Close()
 		if copyErr != nil {
-			fmt.Fprintf(os.Stderr, "[Warn] cannot copy %s: %v, skip.\n", imgName, copyErr)
+			progress(float64(i)/total, fmt.Sprintf("写入失败: %s", imgName))
 			continue
 		}
+		progress(float64(i+1)/total, fmt.Sprintf("已导出 %d/%d", i+1, int(total)))
 	}
-	fmt.Printf("Done. Extracted %d images into %s with mode [%s]\n", len(imageOrder), zipPath, *mode)
+	progress(1, "完成！")
+	return nil
+}
+
+func scanEpubsInDir(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	files := []string{}
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.HasSuffix(strings.ToLower(entry.Name()), ".epub") {
+			files = append(files, filepath.Join(root, entry.Name()))
+		}
+	}
+	return files, nil
+}
+
+func main() {
+	a := app.New()
+	w := a.NewWindow("EPUB图片批量提取导出")
+	w.Resize(fyne.NewSize(500, 500))
+	fileList := widget.NewLabel("未选择")
+	var filePaths []string
+	var selectedDir string
+	modeRadio := widget.NewRadioGroup([]string{"按页面顺序(page)", "按manifest顺序(manifest)"}, nil)
+	modeRadio.SetSelected("按页面顺序(page)")
+	convertBtn := widget.NewButton("开始转换", func() {})
+	convertBtn.Disable()
+	progressList := container.NewVBox()
+
+	// 初始化时创建一个空容器
+	rightContainer := container.NewMax()
+
+	// 刷新按钮
+	refreshBtn := widget.NewButton("刷新文件列表", func() {
+		if selectedDir == "" {
+			dialog.ShowInformation("请先选择目录", "未选择有效目录，请先点击“选择目录”", w)
+			return
+		}
+		eps, err := scanEpubsInDir(selectedDir)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("扫描目录失败: %v", err), w)
+			return
+		}
+		if len(eps) == 0 {
+			fileList.SetText("该目录下未发现epub文件")
+			convertBtn.Disable()
+			return
+		}
+		filePaths = eps
+		fileList.SetText(fmt.Sprintf("已发现 %d 个epub文件:\n%s", len(filePaths), strings.Join(filePaths, "\n")))
+		convertBtn.Enable()
+	})
+
+	selectBtn := widget.NewButton("选择包含epub文件的目录", func() {
+		dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
+			if err != nil || u == nil {
+				return
+			}
+			dirPath := u.Path()
+			selectedDir = dirPath
+			eps, err := scanEpubsInDir(dirPath)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("扫描目录失败: %v", err), w)
+				return
+			}
+			if len(eps) == 0 {
+				fileList.SetText("该目录下未发现epub文件")
+				convertBtn.Disable()
+				return
+			}
+			filePaths = eps
+			fileList.SetText(fmt.Sprintf("已发现 %d 个epub文件:\n%s", len(filePaths), strings.Join(filePaths, "\n")))
+			convertBtn.Enable()
+		}, w)
+	})
+
+	convertBtn.OnTapped = func() {
+		convertBtn.Disable()
+		progressList.Objects = nil
+		var wg sync.WaitGroup
+
+		// 将进度列表设置到右侧容器中并展示
+		rightContainer.Objects = []fyne.CanvasObject{container.NewVScroll(progressList)}
+		rightContainer.Refresh()
+
+		for idx, file := range filePaths {
+			name := filepath.Base(file)
+			progBar := widget.NewProgressBar()
+			progBar.Resize(fyne.NewSize(700, 30))
+			label := widget.NewLabel("")
+			label.Wrapping = fyne.TextWrapWord
+			row := container.NewVBox(widget.NewLabel(name), progBar, label)
+			progressList.Add(row)
+			progressList.Refresh()
+			wg.Add(1)
+			go func(idx int, file string, pb *widget.ProgressBar, label *widget.Label) {
+				defer wg.Done()
+				var mode string
+				if strings.Contains(modeRadio.Selected, "page") {
+					mode = "page"
+				} else {
+					mode = "manifest"
+				}
+				err := convertEpub(file, mode, func(p float64, text string) {
+					pb.SetValue(p)
+					label.SetText(text)
+				})
+				if err != nil {
+					label.SetText(fmt.Sprintf("错误: %v", err))
+				}
+			}(idx, file, progBar, label)
+		}
+		go func() {
+			wg.Wait()
+			convertBtn.Enable()
+		}()
+	}
+
+	leftContent := container.NewVBox(
+		widget.NewLabel("操作步骤："),
+		widget.NewLabel("1. 选择一个包含epub的目录"),
+		widget.NewLabel("2. 可随时点击“刷新文件列表”"),
+		widget.NewLabel("3. 选择图片提取模式"),
+		widget.NewLabel("4. 点击“开始转换”"),
+		fileList,
+		container.NewHBox(selectBtn, refreshBtn),
+		modeRadio,
+		convertBtn,
+		widget.NewSeparator(),
+	)
+
+	// 使用布局管理器来调整显示逻辑
+	content := container.New(layout.NewBorderLayout(nil, nil, leftContent, rightContainer), leftContent, rightContainer)
+	w.SetContent(content)
+	w.ShowAndRun()
 }
